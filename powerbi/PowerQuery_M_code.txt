@@ -1,0 +1,269 @@
+#####################################################################
+ OPTIONAL / ADVANCED VERSION
+ Your course slides say custom M code is out of scope, so use
+ PowerQuery_Step_by_Step.md (point-and-click) for the assignment.
+ This file does the same cleaning in hand-written M, for reference only.
+#####################################################################
+
+=====================================================================
+ POWER QUERY (M) CODE - PHASE 1 CLEANING IN POWER BI
+ Create each block below as its own query:
+   Home > Get Data > Blank Query > Advanced Editor > paste > Done,
+   then rename the query (right-click > Rename) to the name shown.
+ Create them IN THIS ORDER.
+=====================================================================
+
+
+---------------------------------------------------------------------
+ QUERY 1 name:  DataFolder        (a text parameter)
+ Change the path if your folder is somewhere else. Keep the final \
+---------------------------------------------------------------------
+"C:\Users\user\Desktop\class project\" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+
+
+---------------------------------------------------------------------
+ QUERY 2 name:  DateColumns
+---------------------------------------------------------------------
+let
+    Source = {
+        "Reporting Date", "Date of Birth", "Date of Onset/Emergence",
+        "Date of Detection/Seen", "Date Specimen Collected", "Date Specimen Sent",
+        "Date Specimen Received at Lab", "Date Lab Tested/ Reviewed"
+    }
+in
+    Source
+
+
+---------------------------------------------------------------------
+ QUERY 3 name:  fnParseDate
+ Turns '2026-02-06 00:00:00', '30_dec-25', '27-Feb.26', '8-Ffeb-26',
+ 'Feb-15-26', '24/mar/26' ... into a real date. Placeholders such as
+ 'Pending', 'Not done', 'No specimen collected' (no digits) -> null.
+ Impossible dates (31-Apr, 29-Feb-26) -> null.
+---------------------------------------------------------------------
+(raw as any) as nullable date =>
+let
+    MonthList = {"jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"},
+    Typos     = [ffeb = 2, fab = 2, mare = 3, mat = 3, lan = 1, an = 1, jn = 1,
+                 appr = 4, aprial = 4, april = 4, sept = 9, june = 6, july = 7],
+    s0        = if raw = null then "" else Text.Trim(Text.From(raw)),
+    digits    = (t as text) => Text.Select(t, {"0".."9"}),
+    letters   = (t as text) => Text.Select(Text.Lower(t), {"a".."z"}),
+
+    // 1) ISO format - most rows
+    iso = try Date.FromText(Text.Start(s0, 10), [Format = "yyyy-MM-dd"]) otherwise null,
+
+    // 2) Messy formats
+    fallback = try
+        let
+            fixed    = Text.Replace(Text.Replace(Text.Lower(s0), "!", "1"), "3o", "30"),
+            parts    = List.Select(Text.SplitAny(fixed, "-_./;=, "), each _ <> ""),
+            isAlpha  = List.Transform(parts, each letters(_) <> ""),
+            alphaPos = List.PositionOf(isAlpha, true),
+            monthNum = (t as text) =>
+                let l = letters(t) in
+                if Record.HasFields(Typos, l) then Record.Field(Typos, l)
+                else let p = List.PositionOf(MonthList, Text.Start(l, 3)) in
+                     if p >= 0 then p + 1 else error "bad month",
+            fixYear  = (t as text) =>
+                let d = digits(t) in
+                if Text.Length(d) = 4 then Number.From(d)
+                else if Text.Length(d) = 3 then
+                    2000 + Number.From(
+                        if Text.Start(d, 1) = "0" then Text.End(d, 2)
+                        else if Text.End(d, 1) = "6" then "26" else Text.End(d, 2))
+                else if Text.Length(d) = 2 then 2000 + Number.From(d)
+                else null,
+            nums     = if alphaPos < 0 then parts
+                       else List.Select(List.RemoveRange(parts, alphaPos, 1), each digits(_) <> ""),
+            // month-name first ('Feb-15-26') or day first ('25-Feb-26'); numeric = M/D/Y
+            month    = if alphaPos < 0 then Number.From(digits(parts{0})) else monthNum(parts{alphaPos}),
+            dayRaw   = if alphaPos < 0 then Number.From(digits(parts{1})) else Number.From(digits(nums{0})),
+            day      = if dayRaw > 31 then Number.From(Text.End(Text.From(dayRaw), 2)) else dayRaw,
+            yearRaw  = if alphaPos < 0 then fixYear(parts{2})
+                       else if List.Count(nums) > 1 then fixYear(nums{1}) else null,
+            year     = if yearRaw = null then 2026 else yearRaw
+        in
+            #date(year, month, day)
+    otherwise null,
+
+    hasDigit  = digits(s0) <> "",
+    isTime    = Text.Contains(Text.Start(s0, 3), ":"),
+    Result    = if s0 = "" or not hasDigit or isTime then null
+                else if iso <> null then iso
+                else fallback
+in
+    Result
+
+
+---------------------------------------------------------------------
+ QUERY 4 name:  fnRawLinelist
+ Loads a CSV, promotes headers, trims spaces, adds a row_id.
+---------------------------------------------------------------------
+(fileName as text) as table =>
+let
+    Source   = Csv.Document(File.Contents(DataFolder & fileName),
+                   [Delimiter = ",", Encoding = 65001, QuoteStyle = QuoteStyle.Csv]),
+    Promoted = Table.PromoteHeaders(Source, [PromoteAllScalars = true]),
+    // drop the empty, unnamed last column
+    NoBlank  = Table.RemoveColumns(Promoted,
+                   List.Select(Table.ColumnNames(Promoted), each _ = "" or Text.StartsWith(_, "Column"))),
+    Trimmed  = Table.TransformColumns(NoBlank,
+                   List.Transform(Table.ColumnNames(NoBlank),
+                       (c) => {c, each if _ = null then "" else Text.Clean(Text.Trim(_)), type text})),
+    Indexed  = Table.AddIndexColumn(Trimmed, "row_id", 0, 1, Int64.Type)
+in
+    Indexed
+
+
+---------------------------------------------------------------------
+ QUERY 5 name:  fnCleanLinelist
+ All Phase 1 cleaning rules.
+---------------------------------------------------------------------
+(fileName as text) as table =>
+let
+    Raw = fnRawLinelist(fileName),
+
+    // ---------- 1. Dates ----------
+    ParsedDates = Table.TransformColumns(Raw,
+        List.Transform(DateColumns, (c) => {c, fnParseDate, type date})),
+    // event dates outside 2025-2026 are typos -> null (Date of Birth excluded)
+    RangeChecked = Table.TransformColumns(ParsedDates,
+        List.Transform(List.RemoveItems(DateColumns, {"Date of Birth"}),
+            (c) => {c, each if _ = null then null
+                            else if _ < #date(2025, 1, 1) or _ > #date(2026, 12, 31) then null
+                            else _, type date})),
+    DobCheck = Table.TransformColumns(RangeChecked,
+        {{"Date of Birth", each if _ = null then null else if _ > #date(2026, 12, 31) then null else _, type date}}),
+
+    // logical sequence: Onset <= Detection <= Collected <= Sent <= Received <= Tested
+    SeqFlag = Table.AddColumn(DobCheck, "Date Sequence Violation", each
+        let d = List.RemoveNulls({
+                    [#"Date of Onset/Emergence"], [#"Date of Detection/Seen"],
+                    [#"Date Specimen Collected"], [#"Date Specimen Sent"],
+                    [#"Date Specimen Received at Lab"], [#"Date Lab Tested/ Reviewed"]})
+        in List.Count(d) > 1 and
+           List.AnyTrue(List.Transform({1 .. List.Count(d) - 1}, (i) => d{i} < d{i - 1})),
+        type logical),
+
+    // ---------- 2. Age ----------
+    AgeTypeFixed = Table.TransformColumns(SeqFlag,
+        {{"Age Type", each Text.Proper(Text.Trim(_)), type text}}),
+    AgeYears = Table.AddColumn(AgeTypeFixed, "Age in Years", each
+        let n = try Number.From([Patient Age], "en-US") otherwise null,
+            t = [Age Type],
+            f = if t = "Years" then 1
+                else if t = "Months" then 1 / 12
+                else if t = "Weeks" then 1 / 52.1775
+                else if t = "Days" then 1 / 365.25
+                else if t = "Minutes" then 1 / 525960
+                else null
+        in if n = null or f = null then null else Number.Round(n * f, 3),
+        type number),
+    AgeGroup = Table.AddColumn(AgeYears, "Age Group", each
+        let a = [Age in Years] in
+        if a = null then null
+        else if a < 1 then "<1 year"
+        else if a < 5 then "1-4 years"
+        else if a < 10 then "5-9 years"
+        else if a < 15 then "10-14 years"
+        else "15+ years", type text),
+
+    // ---------- 3. Vaccination status & doses ----------
+    VaccStatus = Table.TransformColumns(AgeGroup, {{"Vaccination Status", each
+        let s = Text.Lower(_) in
+        if Text.StartsWith(s, "not vac") then "Not vaccinated"
+        else if Text.StartsWith(s, "not a") then "Not applicable"
+        else if Text.StartsWith(s, "vac") or Text.StartsWith(s, "up to date") then "Vaccinated"
+        else "Unknown", type text}}),
+    DosesClean = Table.AddColumn(VaccStatus, "Doses_tmp", each
+        let s = Text.Lower([Vaccine Doses]) in
+        if [Vaccination Status] = "Not vaccinated" or List.Contains({"0", "o", "not vaccinated"}, s) then "0"
+        else if Text.Contains(s, "2") or Text.Contains(s, "3") then "2"
+        else if Text.EndsWith(s, "/1") then "1"
+        else if Text.Contains(s, "0.5") or Text.Contains(s, "o.5") then "Unknown"   // volume, not a dose count
+        else if Text.Contains(s, "1") or Text.Contains(s, "one") then "1"
+        else "Unknown", type text),
+    DosesReplaced = Table.RenameColumns(Table.RemoveColumns(DosesClean, {"Vaccine Doses"}),
+        {{"Doses_tmp", "Vaccine Doses"}}),
+    DoseGroup = Table.AddColumn(DosesReplaced, "Dose Group", each
+        if [Vaccine Doses] = "0" then "Zero-Dose"
+        else if [Vaccine Doses] = "1" then "1 Dose"
+        else if [Vaccine Doses] = "2" then "2+ Doses"
+        else "Unknown", type text),
+
+    // ---------- 4. Other categories used in Phases 2-4 ----------
+    Categories = Table.TransformColumns(DoseGroup, {
+        {"Disease/Condition", each if Text.Lower(_) = "mpox" then "Mpox"
+                               else if Text.Lower(_) = "yellow fever" then "Yellow fever" else _, type text},
+        {"Outcome", Text.Proper, type text},
+        {"Community Case Detection", Text.Proper, type text}}),
+    EpiStd = Table.AddColumn(Categories, "Final Epi-classification (std)", each
+        let s = Text.Lower([#"Final Epi-classification"]) in
+        if Text.Contains(s, "lab") or s = "confirmed" then "Laboratory-Confirmed"
+        else if Text.Contains(s, "epi") then "Epidemiologically Linked"
+        else if Text.Contains(s, "clinic") then "Clinically Compatible"
+        else if Text.Contains(s, "discard") or Text.Contains(s, "not a case") or Text.Contains(s, "negative") then "Discarded"
+        else if List.Contains({"", "not provided", "not applicable"}, s) then "Missing"
+        else "Suspected/Pending/Other", type text),
+    LabStd = Table.AddColumn(EpiStd, "Final Laboratory Result (std)", each
+        let s = Text.Lower([Final Laboratory Result]) in
+        if Text.StartsWith(s, "negative") then "Negative"
+        else if Text.StartsWith(s, "positive") or s = "confirmed" then "Positive"
+        else if Text.StartsWith(s, "pending") or Text.Contains(s, "sent to lab") then "Pending"
+        else "Not tested / Other", type text),
+
+    // ---------- 5. Helper columns for the dashboard ----------
+    IsMeasles = Table.AddColumn(LabStd, "IsMeasles", each
+        if Text.Lower([#"Disease/Condition"]) = "measles" then 1 else 0, Int64.Type),
+    Location = Table.AddColumn(IsMeasles, "Map Location", each
+        [Reporting District] & ", " & [Reporting County] & ", Democratic Republic of the Congo", type text),
+    EpiWeekNum = Table.TransformColumnTypes(Location, {{"Epi week", Int64.Type}})
+in
+    EpiWeekNum
+
+
+---------------------------------------------------------------------
+ QUERY 6 name:  Train
+---------------------------------------------------------------------
+let
+    Source = fnCleanLinelist("train_data.csv")
+in
+    Source
+
+
+---------------------------------------------------------------------
+ QUERY 7 name:  Test
+---------------------------------------------------------------------
+let
+    Source = fnCleanLinelist("test_data.csv")
+in
+    Source
+
+
+---------------------------------------------------------------------
+ QUERY 8 name:  DateAudit_Train     (audit log of every date set to null)
+ Duplicate it and change the file name to make DateAudit_Test.
+---------------------------------------------------------------------
+let
+    Raw      = fnRawLinelist("train_data.csv"),
+    Keep     = Table.SelectColumns(Raw, {"row_id"} & DateColumns),
+    Unpivot  = Table.UnpivotOtherColumns(Keep, {"row_id"}, "Date Column", "Raw Value"),
+    Parsed   = Table.AddColumn(Unpivot, "Parsed", each fnParseDate([Raw Value]), type date),
+    Problems = Table.SelectRows(Parsed, each [Parsed] = null),
+    Reason   = Table.AddColumn(Problems, "Reason", each
+        if [Raw Value] = "" then "Blank"
+        else if Text.Select([Raw Value], {"0".."9"}) = "" then "Text placeholder"
+        else "Invalid / unparseable date", type text),
+    Result   = Table.RemoveColumns(Reason, {"Parsed"})
+in
+    Result
+
+ TIP: in DateAudit_Train, select "Date Column" > Transform > Group By > Count Rows
+ to get the missing-date counts per column for Q1.2 (compare with Python's
+ phase1_quality_summary.txt). Out-of-range dates are nulled in fnCleanLinelist,
+ so they are not in this audit table - Python's audit lists them.
+
+ TIP: right-click fnParseDate, fnRawLinelist, fnCleanLinelist, DateColumns,
+ DataFolder, DateAudit_* and untick "Enable load" if you don't want them as
+ tables in the model (keep Train and Test loaded).

@@ -1,0 +1,225 @@
+=====================================================================
+ DAX – PHASE 2 INDICATORS (written with the functions from your DAX slides:
+ IF, SWITCH(TRUE()), DATEDIFF, WEEKDAY, CALCULATE, DIVIDE, AVERAGE, ALL,
+ DISTINCTCOUNT, COUNTROWS)
+
+ Approach (DAX slides 4-9):
+   * CALCULATED COLUMNS "stamp" a fixed property on each row (row context):
+     the number of days between two dates, and a 1/0 flag "target met".
+   * MEASURES do the aggregation (filter context), so the KPIs react to slicers.
+   * A flag column holding 1 (met), 0 (not met) or BLANK (can't be assessed)
+     makes every timeliness % simply the AVERAGE of the flag, because AVERAGE
+     ignores blanks.
+
+ Where to type them:
+   Calculated column: Data view > select the Train table > Table tools > New column
+   Measure: first make a measure table (slide 10): Home > Enter data >
+            name it "_Measures" > Load. Then select it > New measure.
+ Formatting: select each % measure > Measure tools > % format, 1 decimal.
+=====================================================================
+
+
+---------------- A. CALCULATED COLUMNS (on Train) ----------------
+
+Days Report to Investigation =
+IF (
+    NOT ISBLANK ( Train[Reporting Date] ) && NOT ISBLANK ( Train[Date of Detection/Seen] ),
+    DATEDIFF ( Train[Reporting Date], Train[Date of Detection/Seen], DAY )
+)
+
+Days Sent to Received =
+IF (
+    NOT ISBLANK ( Train[Date Specimen Sent] ) && NOT ISBLANK ( Train[Date Specimen Received at Lab] ),
+    DATEDIFF ( Train[Date Specimen Sent], Train[Date Specimen Received at Lab], DAY )
+)
+
+Days Received to Tested =
+IF (
+    NOT ISBLANK ( Train[Date Specimen Received at Lab] ) && NOT ISBLANK ( Train[Date Lab Tested/ Reviewed] ),
+    DATEDIFF ( Train[Date Specimen Received at Lab], Train[Date Lab Tested/ Reviewed], DAY )
+)
+
+Days Onset to Collection =
+IF (
+    NOT ISBLANK ( Train[Date of Onset/Emergence] ) && NOT ISBLANK ( Train[Date Specimen Collected] ),
+    DATEDIFF ( Train[Date of Onset/Emergence], Train[Date Specimen Collected], DAY )
+)
+
+// ---- 1/0 flags. BLANK = dates missing or in the wrong order (sequence error),
+//      so the record is left out of the denominator.
+
+Investigated Within 48h =
+SWITCH (
+    TRUE (),
+    ISBLANK ( Train[Days Report to Investigation] ), BLANK (),
+    Train[Days Report to Investigation] < 0, BLANK (),
+    Train[Days Report to Investigation] <= 2, 1,
+    0
+)
+
+Transported Within 3 Days =
+SWITCH (
+    TRUE (),
+    ISBLANK ( Train[Days Sent to Received] ), BLANK (),
+    Train[Days Sent to Received] < 0, BLANK (),
+    Train[Days Sent to Received] <= 3, 1,
+    0
+)
+
+Lab Result Within 7 Days =
+SWITCH (
+    TRUE (),
+    ISBLANK ( Train[Days Received to Tested] ), BLANK (),
+    Train[Days Received to Tested] < 0, BLANK (),
+    Train[Days Received to Tested] <= 7, 1,
+    0
+)
+
+Specimen Within 28 Days =
+SWITCH (
+    TRUE (),
+    ISBLANK ( Train[Days Onset to Collection] ), BLANK (),
+    Train[Days Onset to Collection] < 0, BLANK (),
+    Train[Days Onset to Collection] <= 28, 1,
+    0
+)
+
+// Completeness: all 5 core fields filled in
+Is Complete =
+IF (
+    NOT ISBLANK ( Train[Age in Years] )
+        && Train[Patient Sex] <> ""
+        && Train[District of Residence] <> ""
+        && Train[Vaccination Status] <> "Unknown"
+        && Train[Final Epi-classification (std)] <> "Missing",
+    1,
+    0
+)
+
+Is Discarded =
+IF (
+    Train[Final Epi-classification (std)] = "Discarded"
+        || Train[Final Laboratory Result (std)] = "Negative",
+    1,
+    0
+)
+
+// Monday of the onset week -> X-axis of the epicurve
+Onset Week Start =
+IF (
+    NOT ISBLANK ( Train[Date of Onset/Emergence] ),
+    Train[Date of Onset/Emergence] - WEEKDAY ( Train[Date of Onset/Emergence], 2 ) + 1
+)
+
+// Sort helper: select Age Group > Column tools > Sort by column > Age Group Order
+Age Group Order =
+SWITCH (
+    Train[Age Group],
+    "<1 year", 1,
+    "1-4 years", 2,
+    "5-9 years", 3,
+    "10-14 years", 4,
+    "15+ years", 5,
+    6
+)
+
+
+---------------- B. BASE MEASURES (put in _Measures) ----------------
+
+Measles Cases =
+CALCULATE ( COUNTROWS ( Train ), Train[Disease/Condition] = "Measles" )
+
+Zero-Dose Measles Cases =
+CALCULATE ( [Measles Cases], Train[Dose Group] = "Zero-Dose" )
+
+Unvaccinated Measles Cases =
+CALCULATE ( [Measles Cases], Train[Vaccination Status] = "Not vaccinated" )
+
+% Zero-Dose =
+DIVIDE ( [Zero-Dose Measles Cases], [Measles Cases] )
+
+
+---------------- C. WHO PERFORMANCE INDICATORS ----------------
+
+// Q2.1 (a) – Timeliness of case investigation (target >= 80%)
+Timeliness Investigation % =
+CALCULATE (
+    AVERAGE ( Train[Investigated Within 48h] ),
+    Train[Disease/Condition] = "Measles"
+)
+
+// Q2.1 (b) – Completeness of case investigation (target >= 80%)
+Completeness % =
+CALCULATE (
+    AVERAGE ( Train[Is Complete] ),
+    Train[Disease/Condition] = "Measles"
+)
+
+Timeliness Transport % =
+CALCULATE ( AVERAGE ( Train[Transported Within 3 Days] ), Train[Disease/Condition] = "Measles" )
+
+Timeliness Lab Results % =
+CALCULATE ( AVERAGE ( Train[Lab Result Within 7 Days] ), Train[Disease/Condition] = "Measles" )
+
+// Adequacy among cases that HAD a specimen
+Adequate Specimens % (of specimens) =
+CALCULATE ( AVERAGE ( Train[Specimen Within 28 Days] ), Train[Disease/Condition] = "Measles" )
+
+// Adequacy among ALL suspected cases (no specimen = not adequate) - stricter WHO view
+Adequate Specimens % (of all cases) =
+DIVIDE (
+    CALCULATE ( SUM ( Train[Specimen Within 28 Days] ), Train[Disease/Condition] = "Measles" ),
+    [Measles Cases]
+)
+
+NMNR Discarded Cases =
+CALCULATE ( [Measles Cases], Train[Is Discarded] = 1 )
+
+// per 100,000 population (5,000,000). Annualised, because the WHO target is per YEAR
+// and the line list covers only some epi weeks.
+NMNR Rate per 100k (annualised) =
+VAR Weeks =
+    CALCULATE ( DISTINCTCOUNT ( Train[Epi week] ), Train[Disease/Condition] = "Measles" )
+RETURN
+    DIVIDE ( [NMNR Discarded Cases], 5000000 ) * 100000 * DIVIDE ( 52, Weeks )
+
+
+---------------- D. EPIDEMIOLOGICAL INDICATORS ----------------
+
+Measles Deaths =
+CALCULATE ( [Measles Cases], Train[Outcome] = "Dead" )
+
+CFR % =
+DIVIDE ( [Measles Deaths], [Measles Cases] )
+
+// "% of total" pattern from DAX slide 29-30 (ALL removes the filter on that column)
+% of Cases by Age Group =
+DIVIDE ( [Measles Cases], CALCULATE ( [Measles Cases], ALL ( Train[Age Group] ) ) )
+
+% of Cases by Sex =
+DIVIDE ( [Measles Cases], CALCULATE ( [Measles Cases], ALL ( Train[Patient Sex] ) ) )
+
+% of Cases by Classification =
+DIVIDE (
+    [Measles Cases],
+    CALCULATE ( [Measles Cases], ALL ( Train[Final Epi-classification (std)] ) )
+)
+
+
+---------------- E. KPI COLOUR MEASURES (conditional formatting) ----------------
+// Card > Format visual > Callout value > Color > fx > Format style: Field value > pick measure
+
+Color Timeliness Investigation = IF ( [Timeliness Investigation %] >= 0.8, "#1A9850", "#D73027" )
+Color Completeness            = IF ( [Completeness %] >= 0.8, "#1A9850", "#D73027" )
+Color Transport               = IF ( [Timeliness Transport %] >= 0.8, "#1A9850", "#D73027" )
+Color Lab Results             = IF ( [Timeliness Lab Results %] >= 0.8, "#1A9850", "#D73027" )
+Color Adequacy                = IF ( [Adequate Specimens % (of all cases)] >= 0.8, "#1A9850", "#D73027" )
+Color NMNR                    = IF ( [NMNR Rate per 100k (annualised)] >= 2, "#1A9850", "#D73027" )
+
+
+---------------- F. CHECK AGAINST PYTHON (training data, measles only) ----------------
+ Timeliness Investigation ~97.8%   Completeness ~86.0%   Transport ~98.4%
+ Lab Results ~100%   Adequate (of specimens) ~98.5%   Adequate (of all cases) ~19.3%
+ NMNR ~0.39 per 100k/yr   CFR ~0.39%
+ Small differences are expected, because Power Query parses a few dates differently
+ from Python. That is a good point to mention in Q1.1.
